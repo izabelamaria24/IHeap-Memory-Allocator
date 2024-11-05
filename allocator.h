@@ -21,6 +21,7 @@ typedef struct IHeap
 } IHeap; 
 
 #define BLOCK_SIZE sizeof(IHeap_Chunk)
+#define ALIGNMENT 4
 
 void* iheap_malloc(size_t size);
 void iheap_free(void* ptr);

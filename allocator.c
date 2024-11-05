@@ -4,9 +4,21 @@
 #include <stdio.h>
 #include <unistd.h>
 #include <assert.h>
+#include <pthread.h>
 
 static IHeap heap = {0};
-int heap_capacity = 1024;
+static int heap_capacity = 1024;
+
+static pthread_mutex_t heap_mutex = PTHREAD_MUTEX_INITIALIZER; // TODO
+static pthread_cond_t coalesce_cond = PTHREAD_COND_INITIALIZER; // TODO
+
+static pthread_t gc_thread; // for garbage collection // TODO
+static volatile int running = 1;
+
+size_t align(size_t size)
+{
+  return (size + (ALIGNMENT - 1)) & ~(ALIGNMENT - 1);
+}
 
 void iheap_init(IHeap* heap, size_t heap_capacity)
 {
@@ -23,6 +35,8 @@ void iheap_init(IHeap* heap, size_t heap_capacity)
   heap->head->chunk_size = heap_capacity;
   heap->head->allocated = false;
   heap->heap_capacity = heap_capacity;
+
+  pthread_create(&gc_thread, NULL, garbage_collector, NULL);
 }
 
 IHeap_Chunk* find_best_fit_chunk(IHeap* heap, size_t total_size_requested)
@@ -66,6 +80,8 @@ void* iheap_malloc(size_t size)
 {
   assert(size > 0);
 
+  pthread_mutex_lock(&heap_mutex);
+
   if (heap.head == NULL) 
   {
     iheap_init(&heap, heap_capacity);
@@ -73,13 +89,18 @@ void* iheap_malloc(size_t size)
 
   heap_capacity -= (BLOCK_SIZE + size);
   
-  size_t total_size_requested = size + BLOCK_SIZE;
+  size_t total_size_requested = align(size) + BLOCK_SIZE;
   
   IHeap_Chunk* best_fit_chunk = find_best_fit_chunk(&heap, total_size_requested);
-  if (best_fit_chunk == NULL) return NULL;
+  if (best_fit_chunk == NULL) 
+  {
+    pthread_mutex_unlock(&heap_mutex);
+    return NULL;
+  }
 
   split_chunk(best_fit_chunk, total_size_requested);
   
+  pthread_mutex_unlock(&heap_mutex);
   return (void*)((char*)best_fit_chunk + BLOCK_SIZE);
 }
 
@@ -142,12 +163,56 @@ void coalesce_chunks(IHeap_Chunk* ptr)
 void iheap_free(void* ptr)
 {
   if (ptr == NULL) return;
+
+  pthread_mutex_lock(&heap_mutex);
   
   IHeap_Chunk* chunk = (IHeap_Chunk*)((char*)ptr - BLOCK_SIZE); 
 
   chunk->allocated = false;
 
-  coalesce_chunks(chunk);
+  pthread_cond_signal(&coalesce_cond);
+
+  pthread_mutex_unlock(&heap_mutex);
+}
+
+void* garbage_collector(void* arg)
+{
+  while (running)
+  {
+    pthread_mutex_lock(&heap_mutex);
+
+    pthread_cond_wait(&coalesce_cond, &heap_mutex);
+
+    IHeap_Chunk* current_chunk = heap.head;
+    while (current_chunk != NULL)
+    {
+      if (!current_chunk->allocated)
+      {
+        coalesce_chunks(current_chunk);
+      }
+      current_chunk = current_chunk->next_chunk;
+    }
+
+    pthread_mutex_unlock(&heap_mutex);
+  }
+
+  return NULL;
+}
+
+void iheap_cleanup()
+{
+  running = 0;
+  pthread_cond_signal(&coalesce_cond);
+  pthread_join(gc_thread, NULL);
+}
+
+void cleanup_on_exit()
+{
+  iheap_cleanup();
+}
+
+__attribute__((constructor)) void register_cleanup() {
+    atexit(cleanup_on_exit);
 }
 
 void print_heap(IHeap* heap) {
@@ -169,93 +234,7 @@ void print_heap(IHeap* heap) {
     printf("------------------------------------------------\n\n");
 }
 
-
 int main()
 {
-    printf("=== Initializing Heap ===\n");
-    print_heap(&heap);
-
-    void* blocks[10] = {NULL};
-    int block_count = 0; 
-    printf("block size: %d\n", BLOCK_SIZE);
-    printf("=== Allocating 24 bytes ===\n");
-    blocks[block_count++] = iheap_malloc(24);
-    print_heap(&heap);
-    printf("Allocated pointers: ");
-    for (int i = 0; i < block_count; i++) {
-        printf("%p ", blocks[i]);
-    }
-    printf("\n");
-
-    printf("=== Allocating 64 bytes ===\n");
-    blocks[block_count++] = iheap_malloc(64);
-    print_heap(&heap);
-    printf("Allocated pointers: ");
-    for (int i = 0; i < block_count; i++) {
-        printf("%p ", blocks[i]);
-    }
-    printf("\n");
-
-    printf("=== Allocating 128 bytes ===\n");
-    blocks[block_count++] = iheap_malloc(128);
-    print_heap(&heap);
-    printf("Allocated pointers: ");
-    for (int i = 0; i < block_count; i++) {
-        printf("%p ", blocks[i]);
-    }
-    printf("\n");
-
-    printf("=== Freeing block of 64 bytes ===\n");
-    iheap_free(blocks[1]);
-    block_count--;  
-    print_heap(&heap);
-    printf("Allocated pointers: ");
-    for (int i = 0; i < block_count; i++) {
-        printf("%p ", blocks[i]);
-    }
-    printf("\n");
-
-    printf("=== Freeing block of 24 bytes ===\n");
-    iheap_free(blocks[0]);
-    block_count--;  
-    print_heap(&heap);
-    printf("Allocated pointers: ");
-    for (int i = 0; i < block_count; i++) {
-        printf("%p ", blocks[i]);
-    }
-    printf("\n");
-
-    printf("=== Freeing block of 128 bytes ===\n");
-    iheap_free(blocks[2]);
-    block_count--; 
-    print_heap(&heap);
-    printf("Allocated pointers: ");
-    for (int i = 0; i < block_count; i++) {
-        printf("%p ", blocks[i]);
-    }
-    printf("\n");
-
-    printf("=== Allocating 200 bytes (should fit if coalescing succeeded) ===\n");
-    blocks[block_count++] = iheap_malloc(200);
-    print_heap(&heap);
-    printf("Allocated pointers: ");
-    for (int i = 0; i < block_count; i++) {
-        printf("%p ", blocks[i]);
-    }
-    printf("\n");
-
-    printf("=== Attempting to allocate 2000 bytes (should fail) ===\n");
-    void* block5 = iheap_malloc(2000);
-    if (block5 == NULL) {
-        printf("Allocation of 2000 bytes failed as expected.\n");
-    }
-
-    printf("=== Freeing and Cleaning Up ===\n");
-    if (block_count > 0) {
-        iheap_free(blocks[block_count - 1]);  
-        block_count--; 
-    }
-    print_heap(&heap);
-
-    return 0;
+  return 0;
 }
